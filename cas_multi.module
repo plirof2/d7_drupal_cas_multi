@@ -1,0 +1,365 @@
+<?php
+
+define('CAS_CONFIG_BASE_PATH', 'admin/config/people/cas_multi');
+
+define('CAS_TLS_VERIFY_DEFAULT', 0);
+define('CAS_TLS_VERIFY_CUSTOM', 1);
+define('CAS_TLS_VERIFY_NONE', 2);
+
+/**
+ * Implements hook_menu().
+ */
+function cas_multi_menu() {
+  $includes_path = drupal_get_path('module', 'cas_multi') . '/includes';
+
+  $items = array();
+  $items['cas'] = array(
+    'page callback' => '_cas_multi_service',
+    'page arguments' => array(1),
+    'type' => MENU_CALLBACK,
+    'access callback' => TRUE,
+    'file' => 'cas_multi.service.inc',
+    'file path' => $includes_path,
+  );
+  $items[CAS_CONFIG_BASE_PATH] = array(
+    'title' => 'CAS Configuration',
+    'description' => 'Configure central authentication services',
+    'type' => MENU_NORMAL_ITEM,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('_cas_multi_settings_form'),
+    'access arguments' => array('administer cas_multi'),
+    'file' => 'cas_multi.admin.inc',
+    'file path' => $includes_path,
+  );
+  $items[CAS_CONFIG_BASE_PATH . '/settings'] = array(
+    'title' => 'Settings',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -30,
+  );
+  $items[CAS_CONFIG_BASE_PATH . '/users'] = array(
+    'title' => 'Add Users',
+    'type' => MENU_LOCAL_TASK,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('_cas_multi_bulk_register_users_form'),
+    'access arguments' => array('administer cas_multi'),
+    'file' => 'cas_multi.admin.inc',
+    'file path' => $includes_path,
+    'weight' => -10,
+  );
+  $items['user/%user/cas'] = array(
+    'title' => 'CAS',
+    'page callback' => '_cas_multi_user_identities',
+    'page arguments' => array(1),
+    'access arguments' => array('administer users'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'cas_multi.pages.inc',
+    'file path' => $includes_path,
+    'tab_parent' => 'user/%/edit',
+    'weight' => 1,
+  );
+  $items['user/%user/cas/delete'] = array(
+    'title' => 'Delete CAS Username Association',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('_cas_multi_user_delete_cas_name_form', 1),
+    'access arguments' => array('administer users'),
+    'file' => 'cas_multi.pages.inc',
+    'file path' => $includes_path,
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_menu_alter().
+ */
+function cas_multi_menu_alter(&$items) {
+  // Modify the menu route that our ctools export plugin defines. Basically
+  // we want to define it as a local task to it appears along with our existing
+  // task //tabs.
+  $items[CAS_CONFIG_BASE_PATH . '/server']['type'] = MENU_LOCAL_TASK;
+  $items[CAS_CONFIG_BASE_PATH . '/server']['weight'] = -20;
+
+  // Use our own user login page callback.
+  $items['user']['page callback'] = '_cas_multi_login_page_override';
+  $items['user']['file'] = 'cas_multi.pages.inc';
+  $items['user']['file path'] = drupal_get_path('module', 'cas_multi') . '/includes';
+}
+
+/**
+ * Implements hook_theme().
+ */
+function cas_multi_theme() {
+  $includes_path = drupal_get_path('module', 'cas_multi') . '/includes';
+  return array(
+    'cas_multi_overview_item' => array(
+      'variables' => array('label' => NULL, 'name' => FALSE, 'status' => FALSE),
+      'file' => 'cas_multi.theme.inc',
+      'path' => $includes_path,
+    ),
+    'cas_multi_status' => array(
+      'variables' => array('status' => NULL, 'html' => TRUE),
+      'file' => 'cas_multi.theme.inc',
+      'path' => $includes_path,
+    ),
+    'cas_multi_login_page' => array(
+      'variables' => array('cas_server_configs' => array(), 'standard_login_form' => NULL),
+      'file' => 'cas_multi.theme.inc',
+      'path' => $includes_path,
+    ),
+  );
+}
+
+/**
+ * Implements hook_admin_paths().
+ */
+function cas_multi_admin_paths() {
+  $paths = array(
+    'user/*/cas' => TRUE,
+    'user/*/cas/delete/*' => TRUE,
+  );
+  return $paths;
+}
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function cas_multi_ctools_plugin_directory($module, $plugin) {
+  if ($module == 'ctools' && $plugin == 'export_ui') {
+    return 'plugins/' . $plugin;
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function cas_multi_permission() {
+  return array(
+    'administer cas_multi' => array(
+      'title' => t('Administer CAS'),
+      'description' => t('Configure CAS server, default CAS user roles, login/logout redirection, and other settings.'),
+      'restrict access' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_user_delete().
+ *
+ * Remove the CAS username associated with this user being deleted.
+ * Remove the Drupal/CAS session association(s) for this user.
+ */
+function cas_multi_user_delete($account) {
+  db_delete('cas_multi_user')
+    ->condition('uid', $account->uid)
+    ->execute();
+
+  db_delete('cas_multi_login_data')
+    ->condition('uid', $account->uid)
+    ->execute();
+}
+
+/**
+ * Implements hook_user_logout().
+ *
+ * Remove the Drupal/CAS sesison association for this user's Drupal session.
+ */
+function cas_multi_user_logout($account) {
+  db_delete('cas_multi_login_data')
+    ->condition('drupal_session_id', session_id())
+    ->execute();
+}
+
+/**
+ * Implements hook_menu_site_status_alter().
+ *
+ * Allow access to cas login route when site is offline.
+ */
+function cas_multi_menu_site_status_alter(&$menu_site_status, $path) {
+  if ($menu_site_status == MENU_SITE_OFFLINE && user_is_anonymous() && ($path === 'cas' || strpos($path, 'cas/') === 0)) {
+    $menu_site_status = MENU_SITE_ONLINE;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter the user edit form to remove access to the email field and/or password
+ * field if the user is associated with any CAS servers that are configured
+ * to disable those fields.
+ */
+function cas_multi_form_user_profile_form_alter(&$form, &$form_state) {
+  $account = $form['#user'];
+
+  // Collect list of all CAS server IDs this user is associated with.
+  $user_cas_server_names = array();
+  $q = db_query('SELECT DISTINCT server_name FROM {cas_multi_user} WHERE uid = :uid', array('uid' => $account->uid));
+  while ($server_name = $q->fetchField()) {
+    $user_cas_server_names[] = $server_name;
+  }
+
+  if (empty($user_cas_server_names)) {
+    return;
+  }
+
+  ctools_include('export');
+  $all_cas_servers = ctools_export_crud_load_all('cas_multi_server');
+
+  $hide_email = FALSE;
+  $hide_password = FALSE;
+  foreach ($all_cas_servers as $cas_server) {
+    if (isset($cas_server->disabled)) {
+      continue;
+    }
+
+    if (in_array($cas_server->name, $user_cas_server_names)) {
+      if ($cas_server->hide_email) {
+        $hide_email = TRUE;
+      }
+      if ($cas_server->hide_password) {
+        $hide_password = TRUE;
+      }
+    }
+  }
+
+  if (!user_access('administer users')) {
+    // The user is not an administrator, so selectively remove the e-mail
+    // and password fields.
+    if ($hide_email) {
+      $form['account']['mail']['#access'] = FALSE;
+    }
+    if ($hide_password) {
+      $form['account']['pass']['#access'] = FALSE;
+      $form['account']['current_pass']['#access'] = FALSE;
+      $form['account']['current_pass_required_values']['#access'] = FALSE;
+      $form['account']['current_pass_required_values']['#value'] = array();
+      $form['#validate'] = array_diff($form['#validate'], array('user_validate_current_pass'));
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Redirect users who visit the "forgot password" form to another page if
+ * configured to do so.
+ */
+function cas_multi_form_user_pass_alter(&$form, &$form_state) {
+  $forgot_password_redirect = variable_get('cas_multi_forgot_password_redirect');
+  if (!user_access('administer users') && !empty($forgot_password_redirect)) {
+    drupal_goto($forgot_password_redirect);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Redirect users who visit the user registration form to another page if
+ * configured to do so.
+ */
+function cas_multi_form_user_register_form_alter(&$form, &$form_state, $form_id) {
+  $user_registration_redirect = variable_get('cas_multi_user_registration_redirect');
+  if (!user_access('administer users') && !empty($user_registration_redirect)) {
+    drupal_goto($user_registration_redirect);
+  }
+}
+
+/**
+ * Load phpCAS library files.
+ */
+function _cas_multi_load_phpcas_library($path = NULL) {
+  if (!isset($path)) {
+    if (module_exists('libraries')) {
+      $path = libraries_get_path('CAS');
+    }
+    else {
+      $path = variable_get('cas_multi_library_dir', 'CAS');
+    }
+  }
+
+  // Build the name of the file to load.
+  if ($path != '') {
+    $path = rtrim($path, '/') . '/';
+  }
+  $filename = $path . 'CAS.php';
+
+  include_once $filename;
+
+  if (!defined('PHPCAS_VERSION') || !class_exists('phpCAS')) {
+    // The file could not be loaded successfully.
+    return FALSE;
+  }
+
+  return PHPCAS_VERSION;
+}
+
+/**
+ * Register a local Drupal user account for the provided user.
+ *
+ * If $invoke_cas_multi_user_presave is TRUE, then implementations of cas_multi_user_presave
+ * will be invoked after the user has been created.
+ */
+function _cas_multi_register_account($username, $email, $cas_server_config, $invoke_cas_multi_user_presave = FALSE) {
+  if (empty($email)) {
+    $email = $cas_server_config->auto_register_domain ? $username . '@' . $cas_server_config->auto_register_domain : '';
+  }
+
+  $edit = array(
+    'name' => $username,
+    'pass' => user_password(),
+    'init' => $username,
+    'mail' => $email,
+    'status' => 1,
+    'roles' => array(),
+  );
+
+  // Create the user account.
+  $account = user_save(drupal_anonymous_user(), $edit);
+  if (!$account) {
+    return FALSE;
+  }
+  watchdog('user', 'New user: %n (CAS)', array('%n' => $account->name), WATCHDOG_NOTICE, l(t("edit user"), "admin/user/edit/$account->uid"));
+
+  if ($invoke_cas_multi_user_presave) {
+    // Populate $edit with some basic properties and allow other modules to
+    // alter the user object before it is saved again.
+    $edit = array(
+      'cas_user' => array(
+        'name' => $username,
+      ),
+    );
+    _cas_multi_user_module_invoke('presave', $edit, $account);
+    unset($edit['cas_user']);
+    $account = user_save($account, $edit);
+  }
+
+  // Add association of this user account with the CAS username.
+  $cas_user = array(
+    'uid' => $account->uid,
+    'server_name' => $cas_server_config->name,
+    'cas_name' => $username,
+  );
+  drupal_write_record('cas_multi_user', $cas_user);
+
+  // Reload to ensure that we have a fully populated user object.
+  return user_load($account->uid);
+}
+
+/**
+ * Returns true if there exists a Drupal account with the provided username.
+ */
+function _cas_multi_username_is_taken($username) {
+  $result = db_query("SELECT uid FROM {users} WHERE name = :username", array('username' => $username));
+  return $result->fetchField() ? TRUE : FALSE;
+}
+
+/**
+ * Invokes hook_cas_multi_user_TYPE() in every module.
+ *
+ * We cannot use module_invoke() because the arguments need to be passed by
+ * reference.
+ */
+function _cas_multi_user_module_invoke($type, &$edit, $account, $cas_server_config) {
+  foreach (module_implements('cas_multi_user_' . $type) as $module) {
+    $function = $module . '_cas_multi_user_' . $type;
+    $function($edit, $account, $cas_server_config);
+  }
+}

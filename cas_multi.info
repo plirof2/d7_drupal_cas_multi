@@ -1,0 +1,6 @@
+name = CAS Multi
+core = 7.x
+description = CAS Authentication (Multiple CAS Server Support)
+package = Central Authentication Service
+dependencies[] = ctools
+version = 7.x-2.0
